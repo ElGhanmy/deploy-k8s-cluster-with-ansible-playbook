@@ -1,0 +1,217 @@
+---
+- hosts: all
+  become: yes
+  vars:
+    kubernetes_version: 1.29
+    pod_cidr: "192.168.0.0/16"
+    cri_version: "v1.28.0"
+
+  tasks:
+    - name: Enable kernel modules for Kubernetes
+      blockinfile:
+        path: /etc/modules-load.d/k8s.conf
+        create: yes
+        block: |
+          overlay
+          br_netfilter
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Configure sysctl for Kubernetes networking
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/k8s.conf
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+
+    - name: Disable swap
+      shell: |
+        swapoff -a
+      changed_when: false
+
+    - name: Disable swap permanently
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    - name: Install required packages
+      apt:
+        name:
+          - software-properties-common
+          - curl
+          - apt-transport-https
+          - ca-certificates
+        state: present
+        update_cache: yes
+
+    - name: Add CRI-O repository key
+      apt_key:
+        url: https://pkgs.k8s.io/addons:/cri-o:/prerelease:/main/deb/Release.key
+        keyring: /etc/apt/keyrings/cri-o-apt-keyring.gpg
+        state: present
+
+    - name: Add CRI-O repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/prerelease:/main/deb/ /"
+        filename: cri-o
+        state: present
+
+    - name: Install CRI-O
+      apt:
+        name: cri-o
+        state: present
+        update_cache: yes
+
+    - name: Enable and start CRI-O service
+      systemd:
+        name: crio
+        enabled: yes
+        state: started
+
+    - name: Download crictl
+      get_url:
+        url: "https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ cri_version }}/crictl-{{ cri_version }}-linux-amd64.tar.gz"
+        dest: "/tmp/crictl.tar.gz"
+
+    - name: Install crictl
+      unarchive:
+        src: "/tmp/crictl.tar.gz"
+        dest: /usr/local/bin
+        remote_src: yes
+
+    - name: Add Kubernetes repository key
+      apt_key:
+        url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key"
+        keyring: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        state: present
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+        filename: kubernetes
+        state: present
+
+    - name: Install Kubernetes components
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Install jq package
+      apt:
+        name: jq
+        state: present
+        update_cache: yes
+
+- hosts: master
+  become: yes
+  vars:
+    pod_cidr: "192.168.0.0/16"
+  tasks:
+
+    - name: Install python3-pip
+      apt:
+        name: python3-pip
+        state: present
+        update_cache: yes
+
+    - name: Install kubernetes python package
+      pip:
+        name: kubernetes
+        state: present
+
+    - name: Get local IP address
+      shell: ip -json addr show eth1 | jq -r '.[0].addr_info[] | select(.family == "inet") | .local'
+      register: local_ip
+      changed_when: false
+
+    - name: Configure kubelet node IP
+      copy:
+        dest: /etc/default/kubelet
+        content: "KUBELET_EXTRA_ARGS=--node-ip={{ local_ip.stdout }}"
+
+    - name: Initialize Kubernetes cluster
+      shell: |
+        kubeadm init \
+          --control-plane-endpoint="{{ ansible_host }}" \
+          --apiserver-cert-extra-sans="{{ ansible_host }}" \
+          --pod-network-cidr="{{ pod_cidr }}" \
+          --node-name="{{ ansible_hostname }}" \
+          --ignore-preflight-errors=Swap
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Create Kubernetes config directory
+      file:
+        path: "{{ ansible_env.HOME }}/.kube"
+        state: directory
+
+    - name: Copy admin.conf to user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_env.HOME }}/.kube/config"
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Install Calico network plugin
+      k8s:
+        src: https://docs.projectcalico.org/manifests/calico.yaml
+        state: present
+
+    - name: Install Metrics Server
+      k8s:
+        src: https://raw.githubusercontent.com/techiescamp/kubeadm-scripts/main/manifests/metrics-server.yaml
+        state: present
+
+    - name: Get join command
+      shell: kubeadm token create --print-join-command
+      register: join_command_raw
+
+    - name: Set join command fact
+      set_fact:
+        join_command: "{{ join_command_raw.stdout }}"
+
+- hosts: workers
+  become: yes
+  tasks:
+    - name: Get local IP address
+      shell: ip -json addr show eth1 | jq -r '.[0].addr_info[] | select(.family == "inet") | .local'
+      register: local_ip
+      changed_when: false
+
+    - name: Configure kubelet node IP
+      copy:
+        dest: /etc/default/kubelet
+        content: "KUBELET_EXTRA_ARGS=--node-ip={{ local_ip.stdout }}"
+
+    - name: Join Kubernetes cluster
+      shell: "{{ hostvars[groups['master'][0]]['join_command'] }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf  # Prevents re-joining if already joined
+
+ #   - name: Join Kubernetes cluster
+ #     shell: "{{ hostvars[groups['master'][0]]['join_command'] }}"
+ #     when: join_command is defined
